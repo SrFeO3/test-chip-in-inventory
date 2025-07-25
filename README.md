@@ -1,0 +1,1 @@
+# test-chip-in-inventory
