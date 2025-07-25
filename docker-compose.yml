@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: chip-in-inventory-api
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      # Dockerネットワーク内のetcdサービス名を指定します。
+      - ETCD_ENDPOINTS=http://etcd:2379
+    depends_on:
+      - etcd
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.13
+    container_name: etcd
+    ports:
+      # デバッグ用にホストからもetcdにアクセスできるようにします。
+      - "2379:2379"
+    volumes:
+      - etcd-data:/tmp/etcd.s1
+    command: >
+      /usr/local/bin/etcd
+      --name s1 --data-dir /tmp/etcd.s1
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://0.0.0.0:2380
+      --initial-cluster s1=http://0.0.0.0:2380 --initial-cluster-token tkn --initial-cluster-state new
+
+volumes:
+  etcd-data:

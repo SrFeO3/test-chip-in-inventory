@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chip-in Inventory UI (All Resources)</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+    <style>
+        :root { --pico-font-size: 90%; }
+        body { padding-bottom: 4rem; }
+        main { margin-top: 1rem; }
+        nav { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+        nav input { margin-bottom: 0; }
+        table { word-break: break-all; }
+        .overflow-auto { overflow-x: auto; }
+        h2 { margin-top: 2rem; display: flex; justify-content: space-between; align-items: center; }
+        /* Fullscreen modal style */
+        dialog#form-modal {
+            width: 100%;
+            height: 100%;
+            max-width: 100vw;
+            max-height: 100vh;
+            padding: 0;
+            margin: 0;
+        }
+        dialog#form-modal > article { height: 100%; margin: 0; border-radius: 0; display: flex; flex-direction: column; }
+        dialog#form-modal form { flex: 1; overflow-y: auto; width: 100%; max-width: none; }
+        textarea { height: 150px; font-family: monospace; font-size: 0.9em; }
+        .error-toast {
+            position: fixed;
+            bottom: 1rem;
+            right: 1rem;
+            background-color: var(--pico-del-color);
+            color: var(--pico-color-on-del);
+            padding: 1rem;
+            border-radius: var(--pico-border-radius);
+            z-index: 1000;
+            opacity: 0;
+            transition: opacity 0.5s;
+            visibility: hidden;
+        }
+        .error-toast.show { opacity: 1; visibility: visible; }
+    </style>
+</head>
+<body>
+    <header class="container">
+        <h1>Chip-in Inventory UI (All Resources)</h1>
+        <nav>
+            <input type="text" id="api-base-url" placeholder="API Base URL">
+            <input type="password" id="api-token" placeholder="Bearer Token">
+            <button id="refresh-btn">Refresh</button>
+        </nav>
+    </header>
+
+    <main class="container">
+        <section id="all-resources-container">
+            <!-- Resources will be loaded here -->
+        </section>
+        <div id="loading-indicator" aria-busy="true" style="display: none;">Loading...</div>
+    </main>
+
+    <!-- Form Modal -->
+    <dialog id="form-modal">
+        <article>
+            <header>
+                <button aria-label="Close" rel="prev" class="close-modal-btn"></button>
+                <h3 id="modal-title"></h3>
+            </header>
+            <form id="modal-form">
+                <!-- Form fields will be inserted here -->
+                <footer>
+                    <button type="button" class="secondary close-modal-btn">Cancel</button>
+                    <button type="submit" id="modal-submit-btn">Save</button>
+                </footer>
+            </form>
+        </article>
+    </dialog>
+
+    <!-- Delete Confirm Modal -->
+    <dialog id="delete-confirm-modal">
+        <article>
+            <header>
+                <button aria-label="Close" rel="prev" class="close-delete-modal-btn"></button>
+                <h3>Confirm Deletion</h3>
+            </header>
+            <p>
+                Are you sure you want to delete <strong id="delete-item-name"></strong>?
+                This action cannot be undone.
+            </p>
+            <footer>
+                <button type="button" class="secondary close-delete-modal-btn">Cancel</button>
+                <button type="button" id="confirm-delete-btn" class="contrast">Delete</button>
+            </footer>
+        </article>
+    </dialog>
+
+    <div id="error-toast" class="error-toast"></div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    // --- STATE, CONFIG & DOM ELEMENTS ---
+    let state = {
+        apiBaseUrl: '',
+        apiToken: '',
+        deleteHandler: null,
+    };
+    const resourceConfig = {
+        realms: {
+            title: 'Realms', idField: 'name', parent: null,
+            path: (parent, item) => `/realms${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Name (ID)', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'cacert', label: 'CA Certificate', type: 'textarea', required: true }, { name: 'signingKey', label: 'Session Signing Key', type: 'password', required: true }, { name: 'sessionTimeout', label: 'Session Timeout', type: 'number', default: 2592000 }, { name: 'administrators', label: 'Administrators (CSV)', isArray: true }, { name: 'expiredAt', label: 'Expiration', type: 'datetime-local' }, { name: 'disabled', label: 'Disabled', type: 'checkbox' } ] }
+        },
+        zones: {
+            title: 'Zones', idField: 'zone', parent: 'realms',
+            path: (parent, item) => `/realms/${parent.name}/zones${item ? `/${item.zone}` : ''}`,
+            schema: { fields: [ { name: 'zone', label: 'Zone Name (e.g. example.com)', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'dnsProvider', label: 'DNS Provider URN' }, { name: 'acmeCertificateProvider', label: 'ACME Provider URL' } ] }
+        },
+        subdomains: {
+            title: 'Subdomains', idField: 'name', parent: 'zones',
+            path: (parent, item) => `/realms/${parent.realm}/zones/${parent.zone}/subdomains${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Subdomain Name (e.g. www)', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'destinationRealm', label: 'Destination Realm URN' }, { name: 'shareCookie', label: 'Share Cookie', type: 'checkbox' } ] }
+        },
+        'virtual-hosts': {
+            title: 'Virtual Hosts', idField: 'name', parent: 'realms',
+            path: (parent, item) => `/realms/${parent.name}/virtual-hosts${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Name (e.g. www)', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'subdomain', label: 'Subdomain URN', required: true }, { name: 'routingChain', label: 'Routing Chain URN', required: true }, { name: 'certificate', label: 'Certificate', type: 'textarea' }, { name: 'key', label: 'Certificate Key', type: 'textarea' }, { name: 'disabled', label: 'Disabled', type: 'checkbox' } ] }
+        },
+        'routing-chains': {
+            title: 'Routing Chains', idField: 'name', parent: 'realms',
+            path: (parent, item) => `/realms/${parent.name}/routing-chains${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Name', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'rules', label: 'Rules (JSON)', type: 'textarea', isJson: true } ] }
+        },
+        hubs: {
+            title: 'Hubs', idField: 'name', parent: 'realms',
+            path: (parent, item) => `/realms/${parent.name}/hubs${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Name', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'fqdn', label: 'FQDN', required: true }, { name: 'serverPort', label: 'Port', type: 'number', default: 443 }, { name: 'serverCert', label: 'Server Cert', type: 'textarea', required: true }, { name: 'serverCertKey', label: 'Server Cert Key', type: 'textarea', required: true } ] }
+        },
+        services: {
+            title: 'Services', idField: 'name', parent: 'hubs',
+            path: (parent, item) => `/realms/${parent.realm}/hubs/${parent.name}/services${item ? `/${item.name}` : ''}`,
+            schema: { fields: [ { name: 'name', label: 'Name', required: true, readonlyOnEdit: true }, { name: 'title', label: 'Title', required: true }, { name: 'description', label: 'Description', type: 'textarea' }, { name: 'providers', label: 'Providers (CSV)', required: true, isArray: true }, { name: 'consumers', label: 'Consumers (CSV)', required: true, isArray: true }, { name: 'availabilityManagement', label: 'Availability (JSON)', type: 'textarea', isJson: true } ] }
+        }
+    };
+    const elements = {
+        apiBaseUrlInput: document.getElementById('api-base-url'),
+        apiTokenInput: document.getElementById('api-token'),
+        refreshBtn: document.getElementById('refresh-btn'),
+        container: document.getElementById('all-resources-container'),
+        loading: document.getElementById('loading-indicator'),
+        formModal: document.getElementById('form-modal'),
+        modalTitle: document.getElementById('modal-title'),
+        modalForm: document.getElementById('modal-form'),
+        modalSubmitBtn: document.getElementById('modal-submit-btn'),
+        deleteModal: document.getElementById('delete-confirm-modal'),
+        deleteItemName: document.getElementById('delete-item-name'),
+        confirmDeleteBtn: document.getElementById('confirm-delete-btn'),
+        errorToast: document.getElementById('error-toast'),
+    };
+
+    // --- API CLIENT ---
+    const showError = (message) => {
+        console.error(message);
+        elements.errorToast.textContent = message;
+        elements.errorToast.classList.add('show');
+        setTimeout(() => elements.errorToast.classList.remove('show'), 5000);
+    };
+
+    const fetchApi = async (path, options = {}) => {
+        const url = `${state.apiBaseUrl}${path}`;
+        const headers = { 'Content-Type': 'application/json', ...options.headers };
+        if (state.apiToken) headers['Authorization'] = `Bearer ${state.apiToken}`;
+
+        try {
+            const response = await fetch(url, { ...options, headers });
+            if (!response.ok) {
+                const errBody = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errBody || response.statusText}`);
+            }
+            return response.status === 204 ? null : response.json();
+        } catch (error) {
+            showError(error.message);
+            throw error;
+        }
+    };
+
+    // --- RENDER FUNCTIONS ---
+    const renderResourceTable = (title, resourceType, items, parent) => {
+        const config = resourceConfig[resourceType];
+        const parentJson = parent ? JSON.stringify(parent).replace(/"/g, '&quot;') : 'null';
+        let tableHTML = `
+            <h2>
+                ${title}
+                <button onclick="openFormModal('${resourceType}', null, ${parentJson})">Add New</button>
+            </h2>`;
+        
+        if (!items || items.length === 0) {
+            tableHTML += `<p>No items found.</p>`;
+            return tableHTML;
+        }
+        
+        const headers = Object.keys(items[0]);
+
+        tableHTML += `
+            <div class="overflow-auto">
+                <table>
+                    <thead><tr>
+                        ${headers.map(h => `<th>${h}</th>`).join('')}
+                        <th>Actions</th>
+                    </tr></thead>
+                    <tbody>
+                        ${items.map(item => {
+                            const itemJson = JSON.stringify(item).replace(/"/g, '&quot;');
+                            const id = item[config.idField];
+                            return `<tr>
+                                ${headers.map(h => `<td>${(typeof item[h] === 'object' && item[h] !== null) ? JSON.stringify(item[h]) : (item[h] ?? '')}</td>`).join('')}
+                                <td>
+                                    <button class="secondary" onclick="openFormModal('${resourceType}', ${itemJson}, ${parentJson})">Edit</button>
+                                    <button class="contrast" onclick="openDeleteModal('${resourceType}', ${itemJson}, ${parentJson})">Delete</button>
+                                </td>
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            </div>
+        `;
+        return tableHTML;
+    };
+
+    const displayAllResources = async () => {
+        elements.loading.style.display = 'block';
+        elements.container.innerHTML = '';
+        try {
+            // Realms (Level 0)
+            const realms = await fetchApi('/realms') || [];
+            elements.container.innerHTML += renderResourceTable('Realms', 'realms', realms, null);
+
+            for (const realm of realms) {
+                const parentRealm = { name: realm.name };
+                // Level 1 Resources (Zones, VirtualHosts, etc.)
+                const zones = await fetchApi(`/realms/${realm.name}/zones`) || [];
+                const vhosts = await fetchApi(`/realms/${realm.name}/virtual-hosts`) || [];
+                const chains = await fetchApi(`/realms/${realm.name}/routing-chains`) || [];
+                const hubs = await fetchApi(`/realms/${realm.name}/hubs`) || [];
+
+                elements.container.innerHTML += renderResourceTable(`Zones in ${realm.name}`, 'zones', zones, parentRealm);
+                elements.container.innerHTML += renderResourceTable(`Virtual Hosts in ${realm.name}`, 'virtual-hosts', vhosts, parentRealm);
+                elements.container.innerHTML += renderResourceTable(`Routing Chains in ${realm.name}`, 'routing-chains', chains, parentRealm);
+                elements.container.innerHTML += renderResourceTable(`Hubs in ${realm.name}`, 'hubs', hubs, parentRealm);
+
+                for (const zone of zones) {
+                    const parentZone = { realm: realm.name, zone: zone.zone };
+                    const subdomains = await fetchApi(`/realms/${realm.name}/zones/${zone.zone}/subdomains`) || [];
+                    elements.container.innerHTML += renderResourceTable(`Subdomains in ${zone.zone}`, 'subdomains', subdomains, parentZone);
+                }
+
+                for (const hub of hubs) {
+                    const parentHub = { realm: realm.name, name: hub.name };
+                    const services = await fetchApi(`/realms/${realm.name}/hubs/${hub.name}/services`) || [];
+                    elements.container.innerHTML += renderResourceTable(`Services in ${hub.name}`, 'services', services, parentHub);
+                }
+            }
+        } catch (e) {
+            elements.container.innerHTML = `<p>Failed to load resources.</p>`;
+        } finally {
+            elements.loading.style.display = 'none';
+        }
+    };
+
+    // --- MODAL & FORM LOGIC ---
+    const generateFormFields = (resourceType, item) => {
+        const { fields } = resourceConfig[resourceType].schema;
+        return fields.map(field => {
+            let value = item ? (item[field.name] ?? '') : (field.default ?? '');
+            if (field.isArray && Array.isArray(value)) value = value.join(', ');
+            if (field.isJson && typeof value === 'object' && value !== null) value = JSON.stringify(value, null, 2);
+            if (field.type === 'datetime-local' && value) value = new Date(value).toISOString().slice(0, 16);
+            const readonly = (item && field.readonlyOnEdit) ? 'readonly' : '';
+            const inputId = `form-input-${field.name}`;
+            if (field.type === 'checkbox') {
+                return `<div><label for="${inputId}"><input type="checkbox" id="${inputId}" name="${field.name}" ${value ? 'checked' : ''}> ${field.label}</label></div>`;
+            }
+            const inputHtml = (field.type === 'textarea')
+                ? `<textarea id="${inputId}" name="${field.name}" ${field.required ? 'required' : ''} ${readonly}>${value}</textarea>`
+                : `<input type="${field.type || 'text'}" id="${inputId}" name="${field.name}" value="${value}" ${field.required ? 'required' : ''} ${readonly}>`;
+            return `<div><label for="${inputId}">${field.label}</label>${inputHtml}</div>`;
+        }).join('');
+    };
+
+    window.openFormModal = (resourceType, item, parent) => {
+        const isEditing = !!item;
+        elements.modalTitle.textContent = `${isEditing ? 'Edit' : 'Add'} ${resourceConfig[resourceType].title.slice(0, -1)}`;
+        const oldFields = elements.modalForm.querySelector('.grid');
+        if (oldFields) elements.modalForm.removeChild(oldFields);
+        
+        const fieldsContainer = document.createElement('div');
+        // fieldsContainer.className = 'grid'; // Use default block layout for single-column
+        fieldsContainer.innerHTML = generateFormFields(resourceType, item);
+        elements.modalForm.insertBefore(fieldsContainer, elements.modalForm.querySelector('footer'));
+        
+        elements.modalForm.onsubmit = (e) => handleSubmit(e, resourceType, item, parent);
+        elements.formModal.showModal();
+    };
+    const handleSubmit = async (event, resourceType, item, parent) => {
+        event.preventDefault();
+        elements.modalSubmitBtn.setAttribute('aria-busy', 'true');
+        const config = resourceConfig[resourceType];
+        const formData = new FormData(elements.modalForm);
+        const data = item ? { ...item } : {};
+        const isEditing = !!item;
+
+        for(const field of config.schema.fields) {
+            if (isEditing && field.readonlyOnEdit) continue;
+            const value = (field.type === 'checkbox') ? formData.has(field.name) : formData.get(field.name);
+            if (value === '' || value === null) {
+                if (field.type === 'checkbox') {
+                    data[field.name] = false;
+                } else {
+                    delete data[field.name];
+                }
+                continue;
+            }
+            if (field.type === 'number') data[field.name] = Number(value);
+            else if (field.isArray) data[field.name] = value.split(',').map(s => s.trim()).filter(Boolean);
+            else if (field.isJson) try { data[field.name] = JSON.parse(value); } catch(e){ showError(`Invalid JSON in ${field.label}`); elements.modalSubmitBtn.removeAttribute('aria-busy'); return; }
+            else if (field.type === 'datetime-local' && value) data[field.name] = new Date(value).toISOString();
+            else data[field.name] = value;
+        }
+
+        try {
+            // For both POST (create) and PUT (update), we use the collection path.
+            // The path function generates the collection path when the 'item' argument is null.
+            const path = config.path(parent, null);
+            // The method is PUT for editing, POST for creation, as per the OpenAPI spec.
+            const method = isEditing ? 'PUT' : 'POST';
+            await fetchApi(path, { method: method, body: JSON.stringify(data) });
+            elements.formModal.close();
+            displayAllResources();
+        } catch(e) { /* error shown by fetchApi */ }
+        finally { elements.modalSubmitBtn.removeAttribute('aria-busy'); }
+    };
+
+    window.openDeleteModal = (resourceType, item, parent) => {
+        const id = item[resourceConfig[resourceType].idField];
+        elements.deleteItemName.textContent = `${resourceType.slice(0, -1)}: ${id}`;
+        elements.deleteModal.showModal();
+        state.deleteHandler = async () => {
+            elements.confirmDeleteBtn.setAttribute('aria-busy', 'true');
+            try {
+                const path = resourceConfig[resourceType].path(parent, item);
+                await fetchApi(path, { method: 'DELETE' });
+                elements.deleteModal.close();
+                displayAllResources();
+            } catch(e) { /* error shown by fetchApi */ }
+            finally { elements.confirmDeleteBtn.removeAttribute('aria-busy'); state.deleteHandler = null; }
+        };
+    };
+
+    // --- INIT & EVENT LISTENERS ---
+    const init = () => {
+        state.apiBaseUrl = `${window.location.protocol}//${window.location.host}`;
+        elements.apiBaseUrlInput.value = state.apiBaseUrl;
+
+        elements.apiBaseUrlInput.onchange = (e) => { state.apiBaseUrl = e.target.value; };
+        elements.apiTokenInput.onchange = (e) => { state.apiToken = e.target.value; };
+        elements.refreshBtn.onclick = displayAllResources;
+        
+        // Use event delegation for modal close buttons
+        elements.formModal.addEventListener('click', e => {
+            if (e.target.matches('.close-modal-btn')) {
+                elements.formModal.close();
+            }
+        });
+        elements.deleteModal.addEventListener('click', e => {
+            if (e.target.matches('.close-delete-modal-btn')) {
+                elements.deleteModal.close();
+                state.deleteHandler = null;
+            }
+        });
+        
+        elements.confirmDeleteBtn.onclick = () => state.deleteHandler && state.deleteHandler();
+
+        displayAllResources();
+    };
+    
+    init();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chip-in Inventory UI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+    <style>
+        :root { --pico-font-size: 90%; }
+        body { padding-bottom: 4rem; }
+        main { margin-top: 1rem; }
+        nav { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+        nav input { margin-bottom: 0; }
+        table { word-break: break-all; }
+        /* Fullscreen modal style */
+        dialog#form-modal {
+            width: 100%;
+            height: 100%;
+            max-width: 100vw;
+            max-height: 100vh;
+            padding: 0;
+            margin: 0;
+        }
+        dialog#form-modal > article { height: 100%; margin: 0; border-radius: 0; display: flex; flex-direction: column; }
+        dialog#form-modal form { flex: 1; overflow-y: auto; width: 100%; max-width: none; }
+        .hidden { display: none; }
+        .actions button, .actions a {
+            margin: 0 0.2rem;
+            padding: 0.25rem 0.5rem;
+            min-width: 60px;
+            text-align: center;
+        }
+        textarea { height: 150px; font-family: monospace; font-size: 0.9em; }
+        .overflow-auto { overflow-x: auto; }
+        #breadcrumb ul { margin-bottom: 0.5rem; }
+        #resource-table th, #resource-table td { white-space: nowrap; }
+        .error-toast {
+            position: fixed;
+            bottom: 1rem;
+            right: 1rem;
+            background-color: var(--pico-del-color);
+            color: var(--pico-color-on-del);
+            padding: 1rem;
+            border-radius: var(--pico-border-radius);
+            z-index: 1000;
+            opacity: 0;
+            transition: opacity 0.5s;
+        }
+        .error-toast.show { opacity: 1; }
+    </style>
+</head>
+<body>
+    <header class="container">
+        <h1>Chip-in Inventory UI</h1>
+        <nav>
+            <input type="text" id="api-base-url" placeholder="API Base URL" value="http://0.0.0.0:8080">
+            <input type="password" id="api-token" placeholder="Bearer Token">
+            <button id="refresh-btn">Refresh</button>
+        </nav>
+    </header>
+
+    <main class="container">
+        <nav id="breadcrumb" aria-label="breadcrumb">
+            <ul></ul>
+        </nav>
+
+        <section id="resource-view">
+            <article>
+                <header>
+                    <h2 id="resource-title"></h2>
+                    <button id="add-resource-btn" class="hidden">Add New</button>
+                </header>
+                <div id="loading-indicator" aria-busy="true">Loading...</div>
+                <div class="overflow-auto">
+                    <table id="resource-table">
+                        <thead></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </article>
+        </section>
+    </main>
+
+    <dialog id="form-modal">
+        <article>
+            <header>
+                <button aria-label="Close" rel="prev" class="close-modal-btn"></button>
+                <h3 id="modal-title"></h3>
+            </header>
+            <form id="modal-form">
+                <!-- Form fields will be inserted here -->
+                <footer>
+                    <button type="button" class="secondary close-modal-btn">Cancel</button>
+                    <button type="submit" id="modal-submit-btn">Save</button>
+                </footer>
+            </form>
+        </article>
+    </dialog>
+
+    <dialog id="delete-confirm-modal">
+        <article>
+            <header>
+                <button aria-label="Close" rel="prev" class="close-delete-modal-btn"></button>
+                <h3>Confirm Deletion</h3>
+            </header>
+            <p>
+                Are you sure you want to delete <strong id="delete-item-name"></strong>?
+                This action cannot be undone.
+            </p>
+            <footer>
+                <button type="button" class="secondary close-delete-modal-btn">Cancel</button>
+                <button type="button" id="confirm-delete-btn" class="contrast">Delete</button>
+            </footer>
+        </article>
+    </dialog>
+
+    <div id="error-toast" class="error-toast"></div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    // --- STATE & CONFIG ---
+    let state = {
+        apiBaseUrl: 'http://0.0.0.0:8080',
+        apiToken: '',
+        breadcrumbs: [],
+        deleteHandler: null,
+    };
+
+    // --- DOM ELEMENTS ---
+    const apiBaseUrlInput = document.getElementById('api-base-url');
+    const apiTokenInput = document.getElementById('api-token');
+    const refreshBtn = document.getElementById('refresh-btn');
+    const breadcrumbNav = document.querySelector('#breadcrumb ul');
+    const resourceView = document.getElementById('resource-view');
+    const resourceTitle = document.getElementById('resource-title');
+    const addResourceBtn = document.getElementById('add-resource-btn');
+    const loadingIndicator = document.getElementById('loading-indicator');
+    const resourceTable = document.getElementById('resource-table');
+    const resourceTableHead = resourceTable.querySelector('thead');
+    const resourceTableBody = resourceTable.querySelector('tbody');
+    const formModal = document.getElementById('form-modal');
+    const modalTitle = document.getElementById('modal-title');
+    const modalForm = document.getElementById('modal-form');
+    const modalSubmitBtn = document.getElementById('modal-submit-btn');
+    const deleteConfirmModal = document.getElementById('delete-confirm-modal');
+    const deleteItemName = document.getElementById('delete-item-name');
+    const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
+    const errorToast = document.getElementById('error-toast');
+
+    // --- SCHEMAS MAPPING & DEFINITIONS ---
+    const resourceConfig = {
+        realms: {
+            title: 'Realms',
+            idField: 'name',
+            parent: null,
+            children: ['zones', 'virtual-hosts', 'routing-chains', 'hubs'],
+            columns: ['name', 'title', 'disabled', 'expiredAt'],
+            schema: {
+                fields: [
+                    { name: 'name', label: 'Name (ID)', type: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$', readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'cacert', label: 'CA Certificate (PEM)', type: 'textarea', required: true },
+                    { name: 'signingKey', label: 'Session Signing Key', type: 'password', required: true, minLength: 24 },
+                    { name: 'sessionTimeout', label: 'Session Timeout (sec)', type: 'number', default: 2592000 },
+                    { name: 'administrators', label: 'Administrators (comma-separated)', type: 'text', isArray: true },
+                    { name: 'expiredAt', label: 'Expiration Date', type: 'datetime-local' },
+                    { name: 'disabled', label: 'Disabled', type: 'checkbox', default: false },
+                ]
+            }
+        },
+        zones: {
+            title: 'Zones',
+            idField: 'zone',
+            parent: 'realms',
+            children: ['subdomains'],
+            columns: ['zone', 'title', 'description', 'dnsProvider'],
+            schema: {
+                fields: [
+                    { name: 'zone', label: 'Zone Name (e.g., example.com)', type: 'text', required: true, readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'dnsProvider', label: 'DNS Provider URN', type: 'text' },
+                    { name: 'acmeCertificateProvider', label: 'ACME Provider URL', type: 'text' },
+                ]
+            }
+        },
+        subdomains: {
+            title: 'Subdomains',
+            idField: 'name',
+            parent: 'zones',
+            children: ['virtual-hosts'], // Virtual Hosts can be nested under Subdomains (though managed at the Realm level)
+            columns: ['name', 'title', 'destinationRealm', 'shareCookie'],
+            schema: {
+                 fields: [
+                    { name: 'name', label: 'Subdomain Name (e.g., stg)', type: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$', readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'destinationRealm', label: 'Destination Realm URN', type: 'text' },
+                    { name: 'shareCookie', label: 'Share Cookie', type: 'checkbox', default: false },
+                ]
+            }
+        },
+        'virtual-hosts': {
+            title: 'Virtual Hosts',
+            idField: 'name',
+            parent: 'realms',
+            children: [],
+            columns: ['name', 'title', 'subdomain', 'routingChain', 'disabled'],
+            schema: {
+                fields: [
+                    { name: 'name', label: 'Name (e.g., www)', type: 'text', required: true, readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'subdomain', label: 'Subdomain URN', type: 'text', required: true },
+                    { name: 'routingChain', label: 'Routing Chain URN', type: 'text', required: true },
+                    { name: 'certificate', label: 'Certificate (PEM)', type: 'textarea' },
+                    { name: 'key', label: 'Certificate Key (PEM)', type: 'textarea' },
+                    { name: 'disabled', label: 'Disabled', type: 'checkbox', default: false },
+                ]
+            }
+        },
+        'routing-chains': {
+            title: 'Routing Chains',
+            idField: 'name',
+            parent: 'realms',
+            children: [],
+            columns: ['name', 'title', 'description'],
+            schema: {
+                fields: [
+                    { name: 'name', label: 'Name', type: 'text', required: true, readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'rules', label: 'Rules (JSON Array)', type: 'textarea', isJson: true },
+                ]
+            }
+        },
+        hubs: {
+            title: 'Hubs',
+            idField: 'name',
+            parent: 'realms',
+            children: ['services'],
+            columns: ['name', 'title', 'fqdn'],
+            schema: {
+                fields: [
+                    { name: 'name', label: 'Name', type: 'text', required: true, readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'fqdn', label: 'FQDN', type: 'text', required: true },
+                    { name: 'serverPort', label: 'Server Port', type: 'number', default: 443 },
+                    { name: 'serverCert', label: 'Server Certificate (PEM)', type: 'textarea', required: true },
+                    { name: 'serverCertKey', label: 'Server Certificate Key (PEM)', type: 'textarea', required: true },
+                ]
+            }
+        },
+        services: {
+            title: 'Services',
+            idField: 'name',
+            parent: 'hubs',
+            children: [],
+            columns: ['name', 'title', 'description'],
+            schema: {
+                fields: [
+                    { name: 'name', label: 'Name', type: 'text', required: true, readonlyOnEdit: true },
+                    { name: 'title', label: 'Title', type: 'text', required: true },
+                    { name: 'description', label: 'Description', type: 'textarea' },
+                    { name: 'providers', label: 'Providers (comma-separated)', type: 'text', required: true, isArray: true },
+                    { name: 'consumers', label: 'Consumers (comma-separated)', type: 'text', required: true, isArray: true },
+                    { name: 'availabilityManagement', label: 'Availability Management (JSON)', type: 'textarea', isJson: true },
+                ]
+            }
+        }
+        // Note: Virtual Hosts are technically managed at the Realm level, but we allow navigation to them from Subdomains for better UX.
+    };
+
+    // --- API CLIENT ---
+    function showError(message) {
+        console.error(message);
+        errorToast.textContent = message;
+        errorToast.classList.add('show');
+        setTimeout(() => {
+            errorToast.classList.remove('show');
+        }, 5000);
+    }
+
+    async function fetchApi(path, options = {}) {
+        const url = `${state.apiBaseUrl}${path}`;
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers,
+        };
+        if (state.apiToken) {
+            headers['Authorization'] = `Bearer ${state.apiToken}`;
+        }
+
+        try {
+            const response = await fetch(url, { ...options, headers });
+            if (!response.ok) {
+                let errorMsg = `HTTP Error: ${response.status} ${response.statusText}`;
+                try {
+                    const errBody = await response.json();
+                    errorMsg += ` - ${errBody.message || JSON.stringify(errBody)}`;
+                } catch (e) { /* Ignore if body is not JSON */ }
+                throw new Error(errorMsg);
+            }
+            if (response.status === 204 || response.headers.get("content-length") === "0") {
+                 return null; // No content
+            }
+            return await response.json();
+        } catch (error) {
+            showError(error.message);
+            throw error;
+        }
+    }
+
+    // --- PATH BUILDER ---
+    function getPathFor(breadcrumbs, itemName = null) {
+        let path = '';
+        for (let i = 0; i < breadcrumbs.length; i++) {
+            const crumb = breadcrumbs[i];
+            switch (crumb.type) {
+                case 'realms':
+                    path += `/${crumb.type}`;
+                    break;
+                case 'zones':
+                case 'hubs':
+                    path += `/${crumb.id}/${crumb.type}`;
+                    break;
+            }
+        }
+        if (itemName) {
+            path += `/${itemName}`;
+        }
+        return path;
+    }
+
+    // --- ROUTING / NAVIGATION ---
+    async function navigateTo(newBreadcrumbs) {
+        state.breadcrumbs = newBreadcrumbs;
+        renderBreadcrumb();
+        
+        let resourceType;
+        let path;
+        if (newBreadcrumbs.length === 1 && newBreadcrumbs[0].type === 'realms') {
+            resourceType = 'realms'; // Top-level realms list
+            path = '/realms';
+        } else {
+            const currentCrumb = newBreadcrumbs[newBreadcrumbs.length - 1];
+            resourceType = currentCrumb.type;
+            path = getPathFor(newBreadcrumbs);
+        }
+
+        const config = resourceConfig[resourceType];
+        resourceTitle.textContent = config.title;
+        addResourceBtn.classList.toggle('hidden', resourceType === 'virtual-hosts'); // Virtual Hosts are added at the realm level.
+        addResourceBtn.textContent = `Add New ${config.title.slice(0, -1)}`;
+
+        loadingIndicator.style.display = 'block';
+        resourceTable.style.display = 'none';
+
+        try {
+            const data = await fetchApi(path, { method: 'GET' }) || [];
+            renderResourceTable(resourceType, data);
+        } catch (error) {
+            // Error already shown by fetchApi
+            resourceTableBody.innerHTML = `<tr><td colspan="${config.columns.length + 2}">Failed to load data.</td></tr>`;
+        } finally {
+            loadingIndicator.style.display = 'none';
+            resourceTable.style.display = 'table';
+        }
+    }
+
+    // --- RENDER FUNCTIONS ---
+    function renderBreadcrumb() {
+        breadcrumbNav.innerHTML = '';
+        const homeCrumb = document.createElement('li');
+        const homeLink = document.createElement('a');
+        homeLink.href = '#';
+        homeLink.textContent = 'Realms';
+        homeLink.onclick = (e) => {
+            e.preventDefault();
+            navigateTo([{ type: 'realms' }]);
+        };
+        homeCrumb.appendChild(homeLink);
+        breadcrumbNav.appendChild(homeCrumb);
+
+        let cumulativeCrumbs = [{ type: 'realms' }];
+        if (state.breadcrumbs.length > 1) {
+            for (let i = 1; i < state.breadcrumbs.length; i++) {
+                const crumb = state.breadcrumbs[i];
+                cumulativeCrumbs.push(crumb);
+
+                const li = document.createElement('li');
+                if (i < state.breadcrumbs.length - 1) {
+                    const a = document.createElement('a');
+                    a.href = '#';
+                    a.textContent = `${crumb.id} › ${resourceConfig[crumb.type].title}`;
+                    const crumbsForLink = cumulativeCrumbs.slice(0, i + 1);
+                    a.onclick = (e) => {
+                        e.preventDefault();
+                        navigateTo(crumbsForLink);
+                    };
+                    li.appendChild(a);
+                } else {
+                    li.textContent = `${resourceConfig[crumb.type].title}: ${crumb.id}`;
+                }
+
+                breadcrumbNav.appendChild(li);
+            }
+        }
+    }
+
+    function renderResourceTable(resourceType, items) {
+        const config = resourceConfig[resourceType];
+        
+        // Render Header
+        resourceTableHead.innerHTML = `<tr>
+            ${config.columns.map(col => `<th>${col}</th>`).join('')}
+            <th>Details</th>
+            <th>Actions</th>
+        </tr>`;
+
+        // Render Body
+        if (!items || items.length === 0) {
+            resourceTableBody.innerHTML = `<tr><td colspan="${config.columns.length + 2}">No items found.</td></tr>`;
+            return;
+        }
+
+        resourceTableBody.innerHTML = items.map(item => {
+            const id = item[config.idField]; //  <-  ここを修正
+            const detailsButton = config.children.length > 0 
+                ? `<a href="#" class="secondary outline details-btn" role="button" data-id="${id}" data-type="${config.children[0]}">Details</a>`
+                : '';
+            return `
+                <tr data-id="${id}">
+                    ${config.columns.map(col => `<td>${item[col] !== undefined ? item[col] : ''}</td>`).join('')}
+                    <td class="actions">${detailsButton}</td>
+                    <td class="actions">
+                        <button class="edit-btn" data-id="${id}">Edit</button>
+                        <button class="contrast delete-btn" data-id="${id}">Delete</button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+        
+        // Attach listeners for new buttons
+        // イベントリスナーを個別に設定
+        resourceTableBody.querySelectorAll('.details-btn').forEach(btn => 
+          btn.onclick = (e) => {
+              e.preventDefault();
+              const parentId = e.target.dataset.id;
+              const childType = e.target.dataset.type;
+              navigateTo([...state.breadcrumbs, { type: childType, id: parentId }]);
+          }
+      );
+      resourceTableBody.querySelectorAll('.edit-btn').forEach(btn => 
+          btn.onclick = (e) => {
+              const id = e.target.dataset.id;
+              const itemToEdit = items.find(item => item[config.idField] == id);
+              openFormModal(resourceType, itemToEdit);
+          }
+      );
+      resourceTableBody.querySelectorAll('.delete-btn').forEach(btn => 
+          btn.onclick = (e) => {
+              const id = e.target.dataset.id;
+              openDeleteModal(resourceType, id);
+          }
+      );
+    }
+
+    // --- FORM & MODAL LOGIC ---
+
+    function generateFormFields(resourceType, item = null) {
+        const { fields } = resourceConfig[resourceType].schema;
+        const isEditing = item !== null;
+        
+        return fields.map(field => {
+            let value = item ? item[field.name] : (field.default !== undefined ? field.default : '');
+            if (field.isArray && Array.isArray(value)) {
+                value = value.join(', ');
+            }
+            if (field.isJson && typeof value === 'object') {
+                value = JSON.stringify(value, null, 2);
+            }
+            if (field.type === 'datetime-local' && value) {
+                // Format for datetime-local input
+                value = new Date(value).toISOString().slice(0, 16);
+            }
+
+            const readonly = isEditing && field.readonlyOnEdit;
+            const inputId = `form-input-${field.name}`;
+
+            let inputHtml = '';
+            if (field.type === 'textarea') {
+                inputHtml = `<textarea id="${inputId}" name="${field.name}" ${field.required ? 'required' : ''}>${value}</textarea>`;
+            } else if (field.type === 'checkbox') {
+                inputHtml = `<label for="${inputId}">
+                    <input type="checkbox" id="${inputId}" name="${field.name}" ${value ? 'checked' : ''}>
+                    ${field.label}
+                </label>`;
+            } else {
+                inputHtml = `<input type="${field.type}" id="${inputId}" name="${field.name}" value="${value}"
+                    ${field.required ? 'required' : ''}
+                    ${field.pattern ? `pattern="${field.pattern}"` : ''}
+                    ${readonly ? 'readonly' : ''}>`;
+            }
+            
+            if (field.type === 'checkbox') return `<div>${inputHtml}</div>`;
+            
+            return `
+                <div>
+                    <label for="${inputId}">${field.label}</label>
+                    ${inputHtml}
+                </div>
+            `;
+        }).join('');
+    }
+
+    function openFormModal(resourceType, item = null) {
+        const config = resourceConfig[resourceType];
+        const isEditing = item !== null;
+
+        modalTitle.textContent = `${isEditing ? 'Edit' : 'Add'} ${config.title.slice(0, -1)}`;
+        
+        // Clear previous form content before adding new fields
+        const formContent = modalForm.querySelector('footer').previousElementSibling;
+        if (formContent && formContent.tagName !== 'FOOTER') {
+            modalForm.removeChild(formContent);
+        }
+
+        const formFieldsHtml = generateFormFields(resourceType, item);
+        const footer = modalForm.querySelector('footer');
+        const formFieldsContainer = document.createElement('div');
+        // formFieldsContainer.className = 'grid'; // Use default block layout for single-column
+        formFieldsContainer.innerHTML = formFieldsHtml;
+        modalForm.insertBefore(formFieldsContainer, footer);
+
+        formModal.showModal();
+        
+        modalForm.onsubmit = async (e) => {
+            e.preventDefault();
+            modalSubmitBtn.setAttribute('aria-busy', 'true');
+            
+            const formData = new FormData(modalForm);
+            const data = {};
+            
+            for(const field of config.schema.fields) {
+                let value;
+                if (field.type === 'checkbox') {
+                    value = formData.has(field.name);
+                } else {
+                    value = formData.get(field.name);
+                }
+
+                if (value === '' || value === null) continue;
+
+                if (field.type === 'number') {
+                    value = Number(value);
+                } else if (field.isArray) {
+                    value = value.split(',').map(s => s.trim()).filter(Boolean);
+                } else if (field.isJson) {
+                    try {
+                        value = JSON.parse(value);
+                    } catch (jsonError) {
+                        showError(`Invalid JSON in field '${field.label}': ${jsonError.message}`);
+                        modalSubmitBtn.removeAttribute('aria-busy');
+                        return;
+                    }
+                } else if (field.type === 'datetime-local' && value) {
+                    value = new Date(value).toISOString();
+                }
+                data[field.name] = value;
+            }
+
+            try {
+                // For both PUT (update) and POST (create), we must use the collection path
+                // as per the OpenAPI specification. The getPathFor function with a null
+                // item name gives the collection path.
+                const path = getPathFor(state.breadcrumbs, null);
+                const method = isEditing ? 'PUT' : 'POST';
+                await fetchApi(path, { method, body: JSON.stringify(data) });
+                
+                formModal.close();
+                navigateTo(state.breadcrumbs); // Refresh the list
+            } catch (error) {
+                // Error is shown by fetchApi
+            } finally {
+                modalSubmitBtn.removeAttribute('aria-busy');
+            }
+        };
+    }
+
+    function closeFormModal() {
+        formModal.close();
+    }
+
+    // --- DELETE LOGIC ---
+    function openDeleteModal(resourceType, itemId) {
+        deleteItemName.textContent = itemId;
+        deleteConfirmModal.showModal();
+        
+        state.deleteHandler = async () => {
+            confirmDeleteBtn.setAttribute('aria-busy', 'true');
+            try {
+                const path = getPathFor(state.breadcrumbs, itemId);
+                await fetchApi(path, { method: 'DELETE' });
+                deleteConfirmModal.close();
+                navigateTo(state.breadcrumbs); // Refresh
+            } catch (error) {
+                // Error shown by fetchApi
+            } finally {
+                confirmDeleteBtn.removeAttribute('aria-busy');
+                state.deleteHandler = null;
+            }
+        };
+    }
+
+    function closeDeleteModal() {
+        deleteConfirmModal.close();
+        state.deleteHandler = null;
+    }
+
+    // --- EVENT LISTENERS ---
+    function init() {
+        // Automatically set the API Base URL from the current page's origin.
+        // This avoids issues with 0.0.0.0 and makes it easier to use from an external browser.
+        const autoApiBaseUrl = `${window.location.protocol}//${window.location.host}`;
+        apiBaseUrlInput.value = autoApiBaseUrl;
+        state.apiBaseUrl = autoApiBaseUrl;
+
+        // Config inputs
+        apiBaseUrlInput.onchange = (e) => { state.apiBaseUrl = e.target.value; };
+        apiTokenInput.onchange = (e) => { state.apiToken = e.target.value; };
+        
+        // Refresh button
+        refreshBtn.onclick = () => {
+            if (state.breadcrumbs.length > 0) {
+                navigateTo(state.breadcrumbs);
+            } else {
+                navigateTo([{ type: 'realms' }]);
+            }
+        };
+        
+        // Add button
+        addResourceBtn.onclick = () => {
+            const currentCrumb = state.breadcrumbs[state.breadcrumbs.length - 1];
+            openFormModal(currentCrumb.type);
+        };
+
+        // Modal close buttons
+        document.querySelectorAll('.close-modal-btn').forEach(btn => btn.onclick = closeFormModal);
+        document.querySelectorAll('.close-delete-modal-btn').forEach(btn => btn.onclick = closeDeleteModal);
+        
+        // Confirm delete button
+        confirmDeleteBtn.onclick = () => {
+            if (state.deleteHandler) {
+                state.deleteHandler();
+            }
+        };
+        
+        // Initial load
+        navigateTo([{ type: 'realms' }]);
+    }
+    
+    init();
+});
+</script>
+</body>
+</html>
